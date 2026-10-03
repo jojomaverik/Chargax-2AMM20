@@ -62,6 +62,11 @@ class EnvState(jym.EnvState):
     total_charged_kw: float = 0.0
     total_discharged_kw: float = 0.0
 
+    # New Normalized satisfaction reward variables
+    sat_uncharged_norm: float = 0.0
+    sat_overtime_norm: float = 0.0
+    sat_undertime_norm: float = 0.0
+
 
 class Chargax(jym.Environment):
     station: ChargingStation
@@ -108,6 +113,12 @@ class Chargax(jym.Environment):
 
     beta: float = 0.0
     """Discount factor applied to early-departure (undertime) within the time satisfaction penalty."""
+
+    # new reward normalization alpha values
+    norm_satisfaction_alpha: float = 0.0
+    norm_w_uncharged: float = 1.0
+    norm_w_overtime: float = 1.0
+    norm_w_undertime: float = -1.0
 
     # Env options:
     num_discretization_levels: int = 10
@@ -434,12 +445,26 @@ class Chargax(jym.Environment):
             (cars_leaving * jnp.maximum(0, ports.car_time_till_leave)).sum().astype(int)
         )
         num_cars_leaving = cars_leaving.sum()
+
+
+        # New Normalized satisfaction reward values
+        leaving = cars_leaving.astype(jnp.float32)
+        charge_sensitive = ports.charge_sensitive.astype(jnp.float32)
+        planned_stay = jnp.maximum(ports.car_time_waited + ports.car_time_till_leave, self.minutes_per_timestep)
+
+        uncharged_n = leaving * jnp.clip(ports.car_battery_desired_remaining, 0.0, 1.0)
+        overtime_n = leaving * charge_sensitive * jnp.clip(-ports.car_time_till_leave / planned_stay, 0.0, 1.0)
+        undertime_n = leaving * charge_sensitive * jnp.clip(ports.car_time_till_leave / planned_stay, 0.0, 1.0)
+
         return state._replace(
             uncharged_percentages=state.uncharged_percentages + uncharged_percentages,
             uncharged_kw=state.uncharged_kw + uncharged_kw,
             charged_overtime=state.charged_overtime + charged_overtime,
             charged_undertime=state.charged_undertime + charged_undertime,
             served_customers=state.served_customers + num_cars_leaving,
+            sat_uncharged_norm=state.sat_uncharged_norm + uncharged_n.sum(),
+            sat_overtime_norm=state.sat_overtime_norm + overtime_n.sum(),
+            sat_undertime_norm=state.sat_undertime_norm + undertime_n.sum(),
         )
 
     def add_new_cars(
@@ -538,6 +563,18 @@ class Chargax(jym.Environment):
             new_state.total_discharged_kw - old_state.total_discharged_kw
         )  # use discharged kw as proxy for degredation
 
+
+        # New Normalized satisfaction reward values
+        d_uncharged = new_state.sat_uncharged_norm - old_state.sat_uncharged_norm
+        d_overtime = new_state.sat_overtime_norm - old_state.sat_overtime_norm
+        d_undertime = new_state.sat_undertime_norm - old_state.sat_undertime_norm
+
+        normalized_satisfaction_delta = (
+            self.norm_w_uncharged * d_uncharged
+            + self.norm_w_overtime * d_overtime
+            + self.norm_w_undertime * d_undertime
+        )
+
         return profit_delta - (
             self.charged_satisfaction_alpha * uncharged_delta
             + self.time_satisfaction_alpha
@@ -545,6 +582,7 @@ class Chargax(jym.Environment):
             + self.rejected_customers_alpha * rejected_customers_delta
             + self.capacity_exceeded_alpha * exceeded_capacity_delta
             + self.battery_degradation_alpha * battery_degredation_delta
+            + self.norm_satisfaction_alpha * normalized_satisfaction_delta
         )
 
     def get_terminated(self, state: EnvState) -> bool:
@@ -562,10 +600,14 @@ class Chargax(jym.Environment):
             "total_charged_kw": state.total_charged_kw,
             "total_discharged_kw": state.total_discharged_kw,
             "rejected_customers": state.rejected_customers,
+            "served_customers": state.served_customers,
             "uncharged_percentages": state.uncharged_percentages,
             "uncharged_kw": state.uncharged_kw,
             "charged_overtime": state.charged_overtime,
             "charged_undertime": state.charged_undertime,
+            "sat_uncharged_norm": state.sat_uncharged_norm,
+            "sat_overtime_norm": state.sat_overtime_norm,
+            "sat_undertime_norm": state.sat_undertime_norm,
         }
 
     def kw_to_kw_this_timestep(self, kw_drawn: Float[Array, "..."]) -> Array:

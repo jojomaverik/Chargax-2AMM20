@@ -6,9 +6,17 @@ To Replicate the results in the Chargax paper, run the following commands:
     python main.py --traffic low                          # Fig. 4a
     python main.py --traffic medium --charged_alpha 10    # Fig. 4b
     python main.py --traffic medium --time_alpha 20       # Fig. 4c
+
+Normalized user-satisfaction reward (each leaving car contributes a value in [0, 1] per term):
+    python main.py --traffic medium --norm_alpha 10
+    python main.py --traffic medium --norm_alpha 10 --w_overtime 0 --w_undertime 0
+
+Every run appends one row to --results_csv so the experiments can be compared side by side.
 """
 
 import argparse
+import csv
+import os
 
 import equinox as eqx
 import jax
@@ -61,13 +69,85 @@ def build_submission_station() -> ChargingStation:
     return eqx.tree_at(lambda s: s.connections[1].battery_now, station, 0.0)
 
 
+SATISFACTION_KEYS = (
+    "profit",
+    "uncharged_kw",
+    "charged_overtime",
+    "charged_undertime",
+    "served_customers",
+    "rejected_customers",
+    "sat_uncharged_norm",
+    "sat_overtime_norm",
+    "sat_undertime_norm",
+)
+
+
+def evaluate_user_satisfaction(algo, env, key, num_eval_episodes, weights):
+    """Roll out the trained policy and return end-of-day values averaged over episodes,
+    plus per-customer normalized satisfaction terms (0 = fully satisfied, 1 = worst)."""
+    w_uncharged, w_overtime, w_undertime = weights
+
+    def run_episode(key):
+        def step(carry, _):
+            rng, obs, state, episode_reward = carry
+            rng, action_key, step_key = jax.random.split(rng, 3)
+            action = algo.get_action(action_key, algo.state, obs, deterministic=True)
+            (obs, reward, _, _, info), state = env.step(step_key, state, action)
+            info = {k: info[k] for k in SATISFACTION_KEYS}
+            return (rng, obs, state, episode_reward + reward), info
+
+        key, reset_key = jax.random.split(key)
+        obs, state = env.reset(reset_key)
+        (_, _, _, episode_reward), infos = jax.lax.scan(
+            step, (key, obs, state, 0.0), None, length=env.max_episode_steps
+        )
+        # The env auto-resets on the final step, so read the end-of-day totals from
+        # that step's info (computed before the reset) rather than from the state.
+        out = {k: v[-1] for k, v in infos.items()}
+        out["reward"] = episode_reward
+        return out
+
+    episodes = jax.jit(jax.vmap(run_episode))(jax.random.split(key, num_eval_episodes))
+    metrics = {k: float(np.mean(v)) for k, v in episodes.items()}
+
+    served = np.maximum(np.asarray(episodes["served_customers"]), 1)
+    per_user = {
+        k: np.asarray(episodes[k]) / served
+        for k in ("sat_uncharged_norm", "sat_overtime_norm", "sat_undertime_norm")
+    }
+    metrics.update({f"{k}_per_user": float(np.mean(v)) for k, v in per_user.items()})
+    metrics["norm_dissatisfaction_per_user"] = float(
+        np.mean(
+            w_uncharged * per_user["sat_uncharged_norm"]
+            + w_overtime * per_user["sat_overtime_norm"]
+            + w_undertime * per_user["sat_undertime_norm"]
+        )
+    )
+    return metrics
+
+
+def append_results_row(path, row):
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--traffic", choices=["low", "medium", "high"], default="medium")
     parser.add_argument("--charged_alpha", type=float, default=0.0) 
     parser.add_argument("--time_alpha", type=float, default=0.0)  
+    parser.add_argument("--norm_alpha", type=float, default=0.0)
+    parser.add_argument("--w_uncharged", type=float, default=1.0)
+    parser.add_argument("--w_overtime", type=float, default=1.0)
+    parser.add_argument("--w_undertime", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--total_timesteps", type=int, default=10_000_000)
+    parser.add_argument("--num_eval_episodes", type=int, default=125)
+    parser.add_argument("--results_csv", default="results.csv")
     args = parser.parse_args()
 
     rng = jax.random.PRNGKey(args.seed)
@@ -84,6 +164,10 @@ if __name__ == "__main__":
         rejected_customers_alpha=0.0,
         battery_degradation_alpha=0.0,
         beta=0.0,
+        norm_satisfaction_alpha=args.norm_alpha,
+        norm_w_uncharged=args.w_uncharged,
+        norm_w_overtime=args.w_overtime,
+        norm_w_undertime=args.w_undertime,
         default_data_kwargs={
             "car_profile": "eu",
             "user_profile": "shopping",
@@ -118,12 +202,22 @@ if __name__ == "__main__":
 
     print(
         f"Training PPO: traffic={args.traffic}, charged_alpha={args.charged_alpha}, "
-        f"time_alpha={args.time_alpha}, seed={args.seed}, timesteps={args.total_timesteps:,}"
+        f"time_alpha={args.time_alpha}, norm_alpha={args.norm_alpha}, seed={args.seed}, timesteps={args.total_timesteps:,}"
     )
     algo = algo.train(rng, env)
 
-    results = algo.evaluate(rng, env, num_eval_episodes=25)
-    print(f"PPO - Average reward over 25 evaluation episodes: {np.mean(results)}")
+    metrics = evaluate_user_satisfaction(
+        algo,
+        env,
+        rng,
+        args.num_eval_episodes,
+        weights=(args.w_uncharged, args.w_overtime, args.w_undertime),
+    )
+    print(f"PPO - averages over {args.num_eval_episodes} evaluation episodes:")
+    for k, v in metrics.items():
+        print(f"  {k:32s} {v:10.3f}")
+    append_results_row(args.results_csv, {**vars(args), **metrics})
+    print(f"Appended results to {args.results_csv}")
 
     # Compare against baselines:
     print("Evaluating baselines...")
