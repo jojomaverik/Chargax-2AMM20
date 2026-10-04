@@ -9,7 +9,7 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "jax-datetime>=0.1.0",
-    'jaxnasium[algs]>=0.0.29',
+    "jaxnasium[algs]==0.0.29",
 ]
 
 [build-system]

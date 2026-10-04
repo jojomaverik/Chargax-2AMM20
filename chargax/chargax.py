@@ -67,6 +67,15 @@ class EnvState(jym.EnvState):
     sat_overtime_norm: float = 0.0
     sat_undertime_norm: float = 0.0
 
+    # Customer fairness bookkeeping (per scored customer, s_i in [0, 1]).
+    # Per-group arrays: index 0 = time-sensitive, index 1 = charge-sensitive
+    fairness_cost: float = 0.0  # sum_i (1 - s_i)^2  (reward penalty / CMDP cost)
+    group_served: Array = eqx.field(default_factory=lambda: jnp.zeros(2))
+    group_s_sum: Array = eqx.field(default_factory=lambda: jnp.zeros(2))
+    group_s_sq_sum: Array = eqx.field(default_factory=lambda: jnp.zeros(2))
+    group_unfair: Array = eqx.field(default_factory=lambda: jnp.zeros(2))
+    group_min_s: Array = eqx.field(default_factory=lambda: jnp.ones(2))
+
 
 class Chargax(jym.Environment):
     station: ChargingStation
@@ -119,6 +128,12 @@ class Chargax(jym.Environment):
     norm_w_uncharged: float = 1.0
     norm_w_overtime: float = 1.0
     norm_w_undertime: float = -1.0
+
+    # customer fairness
+    fairness_alpha: float = 0.0
+    """Penalty weight (or Lagrange multiplier) on the quadratic fairness cost."""
+    fairness_threshold: float = 0.8
+    """Satisfaction level below which a customer counts as 'unfairly served'."""
 
     # Env options:
     num_discretization_levels: int = 10
@@ -223,6 +238,11 @@ class Chargax(jym.Environment):
             key1, new_state, charging_ports
         )
         new_state, charging_ports = self.add_new_cars(key2, new_state, charging_ports)
+        new_state = self.score_cars_at_end_of_day(
+            new_state,
+            charging_ports,
+            is_last_step=(old_state.timestep + 1) >= self.max_episode_steps,
+        )
 
         # Zero dynamic state for disconnected ports; preserve charger config
         mask = charging_ports.charger_is_car_connected
@@ -456,6 +476,7 @@ class Chargax(jym.Environment):
         overtime_n = leaving * charge_sensitive * jnp.clip(-ports.car_time_till_leave / planned_stay, 0.0, 1.0)
         undertime_n = leaving * charge_sensitive * jnp.clip(ports.car_time_till_leave / planned_stay, 0.0, 1.0)
 
+        state = self.update_fairness_values(state, ports, cars_leaving)
         return state._replace(
             uncharged_percentages=state.uncharged_percentages + uncharged_percentages,
             uncharged_kw=state.uncharged_kw + uncharged_kw,
@@ -466,6 +487,68 @@ class Chargax(jym.Environment):
             sat_overtime_norm=state.sat_overtime_norm + overtime_n.sum(),
             sat_undertime_norm=state.sat_undertime_norm + undertime_n.sum(),
         )
+
+    # ------------------------------------------------------------------
+    # Customer fairness
+    # ------------------------------------------------------------------
+    def customer_satisfaction(self, ports: EVSE) -> Array:
+        """Per-customer satisfaction s_i in [0, 1] for every charger slot.
+
+        Time-sensitive customers (leave at a set time): share of the requested
+        energy that was delivered. Charge-sensitive customers (stay until their
+        target charge): planned stay / actual stay, i.e. 1 without overtime.
+        """
+        requested_kw = (
+            ports.car_desired_battery_percentage * ports.car_battery_capacity_kw
+            - ports.car_arrival_battery_kw
+        )
+        delivered_kw = ports.car_battery_now_kw - ports.car_arrival_battery_kw
+        s_energy = jnp.where(
+            requested_kw > 1e-6,
+            jnp.clip(delivered_kw / jnp.maximum(requested_kw, 1e-6), 0.0, 1.0),
+            1.0,
+        )
+        planned_stay = ports.car_time_waited + ports.car_time_till_leave
+        s_time = jnp.clip(
+            planned_stay / jnp.maximum(ports.car_time_waited, 1), 0.0, 1.0
+        )
+        return jnp.where(ports.charge_sensitive, s_time, s_energy)
+
+    def update_fairness_values(
+        self, state: EnvState, ports: EVSE, scored: Array
+    ) -> EnvState:
+        """Add the customers marked in `scored` to the fairness bookkeeping."""
+        s = self.customer_satisfaction(ports)
+        scored = scored.astype(bool)
+        fairness_cost = (scored * (1.0 - s) ** 2).sum()
+
+        # Group 0 = time-sensitive, group 1 = charge-sensitive: shape (2, num_chargers)
+        in_group = jnp.stack(
+            [scored & ~ports.charge_sensitive, scored & ports.charge_sensitive]
+        )
+        g = in_group.astype(float)
+        return state._replace(
+            fairness_cost=state.fairness_cost + fairness_cost,
+            group_served=state.group_served + g.sum(-1),
+            group_s_sum=state.group_s_sum + (g * s).sum(-1),
+            group_s_sq_sum=state.group_s_sq_sum + (g * s**2).sum(-1),
+            group_unfair=state.group_unfair
+            + (g * (s < self.fairness_threshold)).sum(-1),
+            group_min_s=jnp.minimum(
+                state.group_min_s, jnp.min(jnp.where(in_group, s, 1.0), axis=-1)
+            ),
+        )
+
+    def score_cars_at_end_of_day(
+        self, state: EnvState, ports: EVSE, is_last_step: Array
+    ) -> EnvState:
+        """Charge-sensitive cars only leave once they reach their target, so an agent
+        could avoid the fairness cost by keeping them plugged in until the day ends.
+        On the last step we therefore also score the charge-sensitive cars that are
+        still connected, using the overtime they have built up so far. Time-sensitive
+        cars leave at a fixed time the agent cannot change, so they are not affected."""
+        still_connected = ports.charger_is_car_connected & ports.charge_sensitive
+        return self.update_fairness_values(state, ports, still_connected & is_last_step)
 
     def add_new_cars(
         self, key: PRNGKeyArray, state: EnvState, ports: EVSE
@@ -583,6 +666,7 @@ class Chargax(jym.Environment):
             + self.capacity_exceeded_alpha * exceeded_capacity_delta
             + self.battery_degradation_alpha * battery_degredation_delta
             + self.norm_satisfaction_alpha * normalized_satisfaction_delta
+            + self.fairness_alpha * (new_state.fairness_cost - old_state.fairness_cost)
         )
 
     def get_terminated(self, state: EnvState) -> bool:
@@ -608,6 +692,37 @@ class Chargax(jym.Environment):
             "sat_uncharged_norm": state.sat_uncharged_norm,
             "sat_overtime_norm": state.sat_overtime_norm,
             "sat_undertime_norm": state.sat_undertime_norm,
+            "fairness_cost": state.fairness_cost,
+            **self.get_fairness_metrics(state),
+        }
+
+    def get_fairness_metrics(self, state: EnvState) -> Dict[str, Array]:
+        """Three-layer fairness metrics. Group 0 = time-sensitive, 1 = charge-sensitive.
+        A group without scored customers yet counts as fully satisfied (1.0)."""
+        n, s_sum, sq_sum = state.group_served, state.group_s_sum, state.group_s_sq_sum
+        has = n > 0
+        # 1) Within-group fairness
+        jain = jnp.where(has, s_sum**2 / jnp.maximum(n * sq_sum, 1e-8), 1.0)
+        mean_s = jnp.where(has, s_sum / jnp.maximum(n, 1), 1.0)
+        # Both groups pooled, kept for reference
+        n_all, s_all, sq_all = n.sum(), s_sum.sum(), sq_sum.sum()
+        jain_all = jnp.where(n_all > 0, s_all**2 / jnp.maximum(n_all * sq_all, 1e-8), 1.0)
+        return {
+            "jain_time": jain[0],
+            "jain_charge": jain[1],
+            "min_s_time": state.group_min_s[0],
+            "min_s_charge": state.group_min_s[1],
+            "unfair_time": state.group_unfair[0],
+            "unfair_charge": state.group_unfair[1],
+            "mean_s_time": mean_s[0],
+            "mean_s_charge": mean_s[1],
+            # 2) Between-group fairness: gap in mean satisfaction
+            "group_gap": jnp.abs(mean_s[0] - mean_s[1]),
+            # 3) Summary: the worse of the two groups
+            "worst_group_jain": jnp.min(jain),
+            "worst_group_min_s": jnp.min(state.group_min_s),
+            "jain_overall": jain_all,
+            "mean_s_overall": jnp.where(n_all > 0, s_all / jnp.maximum(n_all, 1), 1.0),
         }
 
     def kw_to_kw_this_timestep(self, kw_drawn: Float[Array, "..."]) -> Array:
