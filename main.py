@@ -11,6 +11,9 @@ Normalized user-satisfaction reward (each leaving car contributes a value in [0,
     python main.py --traffic medium --norm_alpha 10
     python main.py --traffic medium --norm_alpha 10 --w_overtime 0 --w_undertime 0
 
+Customer fairness (Jain's index etc. are reported for every run; this also penalises unfairness):
+    python main.py --traffic medium --fairness_alpha 10
+
 Every run appends one row to --results_csv so the experiments can be compared side by side.
 """
 
@@ -81,6 +84,24 @@ SATISFACTION_KEYS = (
     "sat_undertime_norm",
 )
 
+# Customer-fairness metrics (computed in chargax.py, see get_fairness_metrics).
+# _time = time-sensitive customers, _charge = charge-sensitive customers.
+FAIRNESS_KEYS = (
+    "fairness_cost",  # sum over customers of (1 - s_i)^2, s_i = satisfaction in [0, 1]
+    "jain_time",  # Jain's index of s_i within each group (1 = everyone served equally)
+    "jain_charge",
+    "min_s_time",  # worst-served customer of the day
+    "min_s_charge",
+    "unfair_time",  # customers per day with s_i < 0.8
+    "unfair_charge",
+    "mean_s_time",
+    "mean_s_charge",
+    "group_gap",  # |mean_s_time - mean_s_charge|
+    "worst_group_jain",
+    "worst_group_min_s",
+    "jain_overall",  # both groups pooled
+)
+
 
 def evaluate_user_satisfaction(algo, env, key, num_eval_episodes, weights):
     """Roll out the trained policy and return end-of-day values averaged over episodes,
@@ -93,7 +114,7 @@ def evaluate_user_satisfaction(algo, env, key, num_eval_episodes, weights):
             rng, action_key, step_key = jax.random.split(rng, 3)
             action = algo.get_action(action_key, algo.state, obs, deterministic=True)
             (obs, reward, _, _, info), state = env.step(step_key, state, action)
-            info = {k: info[k] for k in SATISFACTION_KEYS}
+            info = {k: info[k] for k in SATISFACTION_KEYS + FAIRNESS_KEYS}
             return (rng, obs, state, episode_reward + reward), info
 
         key, reset_key = jax.random.split(key)
@@ -127,12 +148,35 @@ def evaluate_user_satisfaction(algo, env, key, num_eval_episodes, weights):
 
 
 def append_results_row(path, row):
-    write_header = not os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row))
-        if write_header:
+    """Append one row to the results CSV.
+    Normally this just appends a line. Only when the row has columns the file does not
+    have yet (e.g. the new fairness metrics) is the file rewritten with the extra columns,
+    so older rows stay aligned (their new columns are left empty). The rewrite goes to a
+    temporary file first, so a crash can never leave a half-written results file."""
+    if not os.path.exists(path):
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row))
             writer.writeheader()
-        writer.writerow(row)
+            writer.writerow(row)
+        return
+
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        fields = list(reader.fieldnames or [])
+        new_fields = [k for k in row if k not in fields]
+        rows = list(reader) if new_fields else None
+
+    if not new_fields:  # same columns as before: plain append, like the original version
+        with open(path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=fields).writerow(row)
+        return
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields + new_fields)
+        writer.writeheader()
+        writer.writerows(rows + [row])
+    os.replace(tmp, path)
 
 
 if __name__ == "__main__":
@@ -141,6 +185,7 @@ if __name__ == "__main__":
     parser.add_argument("--charged_alpha", type=float, default=0.0) 
     parser.add_argument("--time_alpha", type=float, default=0.0)  
     parser.add_argument("--norm_alpha", type=float, default=0.0)
+    parser.add_argument("--fairness_alpha", type=float, default=0.0)  # weight on fairness_cost
     parser.add_argument("--w_uncharged", type=float, default=1.0)
     parser.add_argument("--w_overtime", type=float, default=1.0)
     parser.add_argument("--w_undertime", type=float, default=1.0)
@@ -168,6 +213,7 @@ if __name__ == "__main__":
         norm_w_uncharged=args.w_uncharged,
         norm_w_overtime=args.w_overtime,
         norm_w_undertime=args.w_undertime,
+        fairness_alpha=args.fairness_alpha,
         default_data_kwargs={
             "car_profile": "eu",
             "user_profile": "shopping",
@@ -202,7 +248,8 @@ if __name__ == "__main__":
 
     print(
         f"Training PPO: traffic={args.traffic}, charged_alpha={args.charged_alpha}, "
-        f"time_alpha={args.time_alpha}, norm_alpha={args.norm_alpha}, seed={args.seed}, timesteps={args.total_timesteps:,}"
+        f"time_alpha={args.time_alpha}, norm_alpha={args.norm_alpha}, "
+        f"fairness_alpha={args.fairness_alpha}, seed={args.seed}, timesteps={args.total_timesteps:,}"
     )
     algo = algo.train(rng, env)
 
