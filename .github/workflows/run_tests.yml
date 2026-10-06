@@ -30,7 +30,7 @@ jobs:
 
       - name: Ruff linting and formatting
         uses: astral-sh/ruff-action@v3
-         with:
+        with:
           version: "0.15.20"
 
       - name: Run pytest
