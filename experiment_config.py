@@ -8,7 +8,7 @@ can be put in the same table.
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxnasium.algorithms import PPO  # jaxnasium 0.0.29, same version as the rest of the team
+from jaxnasium.algorithms import PPO  # jaxnasium 0.0.29
 
 from chargax import EVSE, Chargax, ChargingStation
 from chargax._station_layout import StationBattery
