@@ -31,6 +31,7 @@ from jaxtyping import Array, PRNGKeyArray
 
 from chargax import EVSE, Chargax, ChargingStation, StationBattery, StationSplitter
 from chargax.baselines import MaxCharge, Random
+from experiment_config import FixedSchedulePPO
 
 
 def build_submission_station() -> ChargingStation:
@@ -225,7 +226,7 @@ if __name__ == "__main__":
     env = jym.LogWrapper(env)
 
     # PPO settings from the submission branch (PPOConfig + build_ppo_trainer)
-    algo = PPO(
+    algo = FixedSchedulePPO(
         num_envs=12,
         num_steps=300,
         num_minibatches=4,
