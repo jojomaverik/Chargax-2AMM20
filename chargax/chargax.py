@@ -134,6 +134,8 @@ class Chargax(jym.Environment):
     """Penalty weight (or Lagrange multiplier) on the quadratic fairness cost."""
     fairness_threshold: float = 0.8
     """Satisfaction level below which a customer counts as 'unfairly served'."""
+    worst_case_alpha: float = 0.0
+    """Penalty weight on the worst-case (Rawlsian) cost: per group, 1 - lowest s_i so far."""
 
     # Env options:
     num_discretization_levels: int = 10
@@ -667,6 +669,8 @@ class Chargax(jym.Environment):
             + self.battery_degradation_alpha * battery_degredation_delta
             + self.norm_satisfaction_alpha * normalized_satisfaction_delta
             + self.fairness_alpha * (new_state.fairness_cost - old_state.fairness_cost)
+            + self.worst_case_alpha
+            * (self.worst_case_cost(new_state) - self.worst_case_cost(old_state))
         )
 
     def get_terminated(self, state: EnvState) -> bool:
@@ -693,8 +697,13 @@ class Chargax(jym.Environment):
             "sat_overtime_norm": state.sat_overtime_norm,
             "sat_undertime_norm": state.sat_undertime_norm,
             "fairness_cost": state.fairness_cost,
+            "worst_case_cost": self.worst_case_cost(state),
             **self.get_fairness_metrics(state),
         }
+
+    def worst_case_cost(self, state: EnvState) -> Array:
+        """Worst-case (Rawlsian) cost, per group"""
+        return jnp.sum(1.0 - state.group_min_s)
 
     def get_fairness_metrics(self, state: EnvState) -> Dict[str, Array]:
         """Three-layer fairness metrics. Group 0 = time-sensitive, 1 = charge-sensitive.
