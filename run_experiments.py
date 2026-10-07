@@ -39,6 +39,9 @@ METHODS = {
     "PPO": {"env": {}},
     "Fair a=10": {"env": {"fairness_alpha": 10.0}},
     "Fair a=50": {"env": {"fairness_alpha": 50.0}},
+    # Worst-case (Rawlsian) penalty: per group, 1 - lowest satisfaction of the day (0 to 2)
+    "Worst-case a=10": {"env": {"worst_case_alpha": 10.0}},
+    "Worst-case a=50": {"env": {"worst_case_alpha": 50.0}},
     # Budgets on the average daily fairness_cost. For reference (2M-step test run):
     # MaxCharge ~1.7, profit-only PPO ~8. Budgets below ~1.7 may not be reachable.
     "Lagrangian d=4.0": {"budget": 4.0},
@@ -108,14 +111,26 @@ def train_lagrangian(budget, steps, seed, name):
 
 
 def append_rows(path, rows):
+    """Append rows to a CSV. Columns follow the existing file's header; if the new rows
+    have extra columns (e.g. a metric added later), the file is rewritten with those
+    columns added and left empty for the old rows."""
     if not rows:
         return
-    new = not os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        if new:
+    old_rows = load_results(path)
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            fields = next(csv.reader(f), [])
+    else:
+        fields = []
+    extra = [k for r in rows for k in r if k not in fields]
+    fields += list(dict.fromkeys(extra))
+    if not old_rows or extra:  # new file, or new columns: (re)write header + old rows
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, restval="")
             writer.writeheader()
-        writer.writerows(rows)
+            writer.writerows(old_rows)
+    with open(path, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=fields, restval="").writerows(rows)
 
 
 def load_results(path):
@@ -137,7 +152,11 @@ def print_table(rows):
         for k in keys:
             cells = []
             for m in methods:
-                v = np.array([float(r[k]) for r in by_method[m]])
+                # rows from before a metric was added have no value for it
+                v = np.array([float(r[k]) for r in by_method[m] if r.get(k)])
+                if len(v) == 0:
+                    cells.append("-".rjust(width + 8))
+                    continue
                 std = f" ±{v.std():.2f}" if len(v) > 1 else ""
                 cells.append(f"{v.mean():.3f}{std}".rjust(width + 8))
             print(f"{k:22}" + "".join(cells))

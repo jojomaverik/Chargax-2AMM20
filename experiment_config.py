@@ -91,7 +91,7 @@ METRICS = {
         "unfair_time", "unfair_charge",
     ],
     "2) Between groups": ["mean_s_time", "mean_s_charge", "group_gap"],
-    "3) Summary": ["worst_group_jain", "worst_group_min_s", "fairness_cost"],
+    "3) Summary": ["worst_group_jain", "worst_group_min_s", "fairness_cost", "worst_case_cost"],
 }
 METRIC_KEYS = [k for keys in METRICS.values() for k in keys]
 
