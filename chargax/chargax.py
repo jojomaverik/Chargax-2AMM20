@@ -18,6 +18,11 @@ from ._default_data_loaders import (
 )
 from ._station_layout import EVSE, ChargingStation, StationBattery, _PassiveNode
 
+BSR_LEVELS = (0.1, 0.2, 0.5)
+"""Bad service rate thresholds. A time-sensitive customer is badly served when more than
+this share of the requested energy is missing at departure, a charge-sensitive customer
+when the overtime is more than this share of the planned stay."""
+
 
 class EnvState(jym.EnvState):
     grid: ChargingStation
@@ -75,6 +80,12 @@ class EnvState(jym.EnvState):
     group_s_sq_sum: Array = eqx.field(default_factory=lambda: jnp.zeros(2))
     group_unfair: Array = eqx.field(default_factory=lambda: jnp.zeros(2))
     group_min_s: Array = eqx.field(default_factory=lambda: jnp.ones(2))
+    # Bad service counts per group and BSR level: shape (2, len(BSR_LEVELS))
+    group_bad: Array = eqx.field(
+        default_factory=lambda: jnp.zeros((2, len(BSR_LEVELS)))
+    )
+    max_shortfall_kw: float = 0.0  # largest missing energy of a time-sensitive car
+    max_overtime_min: float = 0.0  # largest overtime of a charge-sensitive car
 
 
 class Chargax(jym.Environment):
@@ -529,6 +540,16 @@ class Chargax(jym.Environment):
             [scored & ~ports.charge_sensitive, scored & ports.charge_sensitive]
         )
         g = in_group.astype(float)
+
+        # Bad service: missing energy share (time-sensitive) or overtime share of the
+        # planned stay (charge-sensitive) above each BSR level
+        shortfall_kw = jnp.maximum(ports.car_battery_desired_remaining_kw, 0.0)
+        overtime_min = jnp.maximum(-ports.car_time_till_leave, 0).astype(float)
+        planned_stay = ports.car_time_waited + ports.car_time_till_leave
+        overtime_frac = overtime_min / jnp.maximum(planned_stay, 1)
+        bad_frac = jnp.where(ports.charge_sensitive, overtime_frac, 1.0 - s)
+        is_bad = bad_frac[None, :] > jnp.asarray(BSR_LEVELS)[:, None]  # (levels, N)
+
         return state._replace(
             fairness_cost=state.fairness_cost + fairness_cost,
             group_served=state.group_served + g.sum(-1),
@@ -538,6 +559,13 @@ class Chargax(jym.Environment):
             + (g * (s < self.fairness_threshold)).sum(-1),
             group_min_s=jnp.minimum(
                 state.group_min_s, jnp.min(jnp.where(in_group, s, 1.0), axis=-1)
+            ),
+            group_bad=state.group_bad + (g[:, None, :] * is_bad[None]).sum(-1),
+            max_shortfall_kw=jnp.maximum(
+                state.max_shortfall_kw, jnp.max(in_group[0] * shortfall_kw)
+            ),
+            max_overtime_min=jnp.maximum(
+                state.max_overtime_min, jnp.max(in_group[1] * overtime_min)
             ),
         )
 
@@ -716,6 +744,15 @@ class Chargax(jym.Environment):
         # Both groups pooled, kept for reference
         n_all, s_all, sq_all = n.sum(), s_sum.sum(), sq_sum.sum()
         jain_all = jnp.where(n_all > 0, s_all**2 / jnp.maximum(n_all * sq_all, 1e-8), 1.0)
+        # Bad service rate: share of the scored customers that were badly served
+        bsr = state.group_bad / jnp.maximum(n, 1)[:, None]
+        bsr_all = state.group_bad.sum(0) / jnp.maximum(n.sum(), 1)
+        bsr_metrics = {}
+        for i, level in enumerate(BSR_LEVELS):
+            pct = round(level * 100)
+            bsr_metrics[f"bsr_time_{pct}"] = bsr[0, i]
+            bsr_metrics[f"bsr_charge_{pct}"] = bsr[1, i]
+            bsr_metrics[f"bsr_overall_{pct}"] = bsr_all[i]
         return {
             "jain_time": jain[0],
             "jain_charge": jain[1],
@@ -732,6 +769,10 @@ class Chargax(jym.Environment):
             "worst_group_min_s": jnp.min(state.group_min_s),
             "jain_overall": jain_all,
             "mean_s_overall": jnp.where(n_all > 0, s_all / jnp.maximum(n_all, 1), 1.0),
+            # Rawlsian worst case in raw units
+            "max_shortfall_kw": state.max_shortfall_kw,
+            "max_overtime_min": state.max_overtime_min,
+            **bsr_metrics,
         }
 
     def kw_to_kw_this_timestep(self, kw_drawn: Float[Array, "..."]) -> Array:

@@ -101,6 +101,18 @@ FAIRNESS_KEYS = (
     "worst_group_jain",
     "worst_group_min_s",
     "jain_overall",  # both groups pooled
+    "worst_case_cost",  # (1 - min_s_time) + (1 - min_s_charge)
+    "max_shortfall_kw",  # largest missing energy of a time-sensitive car
+    "max_overtime_min",  # largest overtime of a charge-sensitive car
+    "bsr_time_10",  # share of customers with > 10/20/50% energy missing or overtime
+    "bsr_charge_10",
+    "bsr_overall_10",
+    "bsr_time_20",
+    "bsr_charge_20",
+    "bsr_overall_20",
+    "bsr_time_50",
+    "bsr_charge_50",
+    "bsr_overall_50",
 )
 
 

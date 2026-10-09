@@ -5,6 +5,8 @@ Keep every experiment on this config so results from different team members
 can be put in the same table.
 """
 
+import dataclasses
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -77,6 +79,13 @@ class FixedSchedulePPO(PPO):
     def num_training_updates(self):
         return self.num_iterations * self.num_epochs * self.num_minibatches
 
+    def _collect_rollout(self, rollout_state, env):
+        """train() returns the env info of every step of the run as scan output (incl. a
+        copy of the observation), so memory grows with total_timesteps: ~15 GB at 10M.
+        The info is only used for logging (log_function=None here), so drop it."""
+        rollout_state, trajectory_batch = super()._collect_rollout(rollout_state, env)
+        return rollout_state, dataclasses.replace(trajectory_batch, info=None)
+
 
 def make_ppo(total_timesteps: int, **overrides) -> PPO:
     return FixedSchedulePPO(total_timesteps=total_timesteps, **{**PPO_SETTINGS, **overrides})
@@ -92,6 +101,12 @@ METRICS = {
     ],
     "2) Between groups": ["mean_s_time", "mean_s_charge", "group_gap"],
     "3) Summary": ["worst_group_jain", "worst_group_min_s", "fairness_cost", "worst_case_cost"],
+    # Rawlsian worst case in raw units: largest missing kWh / overtime minutes of the day
+    "4) Worst case": ["max_shortfall_kw", "max_overtime_min"],
+    # Bad service rate: share of customers with > 10/20/50% energy missing or overtime
+    "5) Bad service rate": [
+        f"bsr_{group}_{pct}" for pct in (10, 20, 50) for group in ("time", "charge", "overall")
+    ],
 }
 METRIC_KEYS = [k for keys in METRICS.values() for k in keys]
 
