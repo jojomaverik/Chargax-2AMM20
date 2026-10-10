@@ -18,6 +18,10 @@ from ._default_data_loaders import (
 )
 from ._station_layout import EVSE, ChargingStation, StationBattery, _PassiveNode
 
+GGI_BUFFER_SIZE = 512
+"""Number of customers kept for the GGI penalty. A medium day has ~100 scored
+customers. If a day has more, the least dissatisfied customers are dropped first, with the
+default weights their weight is ~0 anyway (0.5**512)."""
 
 class EnvState(jym.EnvState):
     grid: ChargingStation
@@ -75,6 +79,14 @@ class EnvState(jym.EnvState):
     group_s_sq_sum: Array = eqx.field(default_factory=lambda: jnp.zeros(2))
     group_unfair: Array = eqx.field(default_factory=lambda: jnp.zeros(2))
     group_min_s: Array = eqx.field(default_factory=lambda: jnp.ones(2))
+
+    # Generalized Gini Index (GGI) of today's customers.
+    # Dissatisfaction (1 - s_i) of every scored customer, largest first. Zeros are
+    # empty slots; they count the same as fully satisfied customers (nothing).
+    ggi_dissatisfaction: Array = eqx.field(
+        default_factory=lambda: jnp.zeros(GGI_BUFFER_SIZE)
+    )
+    ggi_cost: float = 0.0  # GGI of ggi_dissatisfaction (reward penalty / CMDP cost)
 
 
 class Chargax(jym.Environment):
@@ -134,6 +146,12 @@ class Chargax(jym.Environment):
     """Penalty weight (or Lagrange multiplier) on the quadratic fairness cost."""
     fairness_threshold: float = 0.8
     """Satisfaction level below which a customer counts as 'unfairly served'."""
+    ggi_alpha: float = 0.0
+    """Penalty weight (or Lagrange multiplier) on the GGI of customer dissatisfaction."""
+    ggi_weight_decay: float = 0.5
+    """GGI weights are 1, d, d^2, ... for the worst, 2nd worst, ... customer of the day.
+    d=0: only the worst customer counts (worst-case). d=1: every customer counts the
+    same (plain sum of 1 - s_i). Values in between: the worse off, the more it counts."""    
 
     # Env options:
     num_discretization_levels: int = 10
@@ -527,7 +545,7 @@ class Chargax(jym.Environment):
             [scored & ~ports.charge_sensitive, scored & ports.charge_sensitive]
         )
         g = in_group.astype(float)
-        return state._replace(
+        state = state._replace(
             fairness_cost=state.fairness_cost + fairness_cost,
             group_served=state.group_served + g.sum(-1),
             group_s_sum=state.group_s_sum + (g * s).sum(-1),
@@ -538,6 +556,26 @@ class Chargax(jym.Environment):
                 state.group_min_s, jnp.min(jnp.where(in_group, s, 1.0), axis=-1)
             ),
         )
+        return self.update_ggi_values(state, s, scored)
+
+    def ggi_weights(self) -> Array:
+        """GGI weights 1, d, d^2, ... (d = ggi_weight_decay), worst customer first."""
+        return jnp.power(self.ggi_weight_decay, jnp.arange(GGI_BUFFER_SIZE))
+
+    def update_ggi_values(self, state: EnvState, s: Array, scored: Array) -> EnvState:
+        """Add the dissatisfaction (1 - s_i) of the scored customers to today's GGI.
+
+        GGI = sum_k w_k * d_(k), with d_(1) >= d_(2) >= ... the dissatisfaction of the
+        day's customers sorted worst first, and w_1 >= w_2 >= ... the weights. The
+        buffer is kept sorted, so the GGI is a single dot product.
+        """
+        new_d = jnp.where(scored, 1.0 - s, 0.0)
+        merged = jnp.concatenate([state.ggi_dissatisfaction, new_d])
+        largest, _ = jax.lax.top_k(merged, GGI_BUFFER_SIZE)  # sorted, largest first
+        return state._replace(
+            ggi_dissatisfaction=largest,
+            ggi_cost=jnp.dot(largest, self.ggi_weights()),
+        )        
 
     def score_cars_at_end_of_day(
         self, state: EnvState, ports: EVSE, is_last_step: Array
@@ -667,6 +705,9 @@ class Chargax(jym.Environment):
             + self.battery_degradation_alpha * battery_degredation_delta
             + self.norm_satisfaction_alpha * normalized_satisfaction_delta
             + self.fairness_alpha * (new_state.fairness_cost - old_state.fairness_cost)
+            # Change in today's GGI: these add up to the end-of-day GGI over the period of a day,
+            # but the agent is penalised at the step the customer leaves.
+            + self.ggi_alpha * (new_state.ggi_cost - old_state.ggi_cost)            
         )
 
     def get_terminated(self, state: EnvState) -> bool:
@@ -693,6 +734,7 @@ class Chargax(jym.Environment):
             "sat_overtime_norm": state.sat_overtime_norm,
             "sat_undertime_norm": state.sat_undertime_norm,
             "fairness_cost": state.fairness_cost,
+            "ggi_cost": state.ggi_cost,            
             **self.get_fairness_metrics(state),
         }
 
