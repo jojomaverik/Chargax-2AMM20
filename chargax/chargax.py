@@ -22,6 +22,11 @@ GGI_BUFFER_SIZE = 512
 """Number of customers kept for the GGI penalty. A medium day has ~100 scored
 customers. If a day has more, the least dissatisfied customers are dropped first, with the
 default weights their weight is ~0 anyway (0.5**512)."""
+BSR_LEVELS = (0.1, 0.2, 0.5)
+"""Bad service rate thresholds. A time-sensitive customer is badly served when more than
+this share of the requested energy is missing at departure, a charge-sensitive customer
+when the overtime is more than this share of the actual stay (both are 1 - s_i)."""
+
 
 class EnvState(jym.EnvState):
     grid: ChargingStation
@@ -79,6 +84,12 @@ class EnvState(jym.EnvState):
     group_s_sq_sum: Array = eqx.field(default_factory=lambda: jnp.zeros(2))
     group_unfair: Array = eqx.field(default_factory=lambda: jnp.zeros(2))
     group_min_s: Array = eqx.field(default_factory=lambda: jnp.ones(2))
+    # Bad service counts per group and BSR level: shape (2, len(BSR_LEVELS))
+    group_bad: Array = eqx.field(
+        default_factory=lambda: jnp.zeros((2, len(BSR_LEVELS)))
+    )
+    max_shortfall_kw: float = 0.0  # largest missing energy of a time-sensitive car
+    max_overtime_min: float = 0.0  # largest overtime of a charge-sensitive car
 
     # Generalized Gini Index (GGI) of today's customers.
     # Dissatisfaction (1 - s_i) of every scored customer, largest first. Zeros are
@@ -152,6 +163,8 @@ class Chargax(jym.Environment):
     """GGI weights are 1, d, d^2, ... for the worst, 2nd worst, ... customer of the day.
     d=0: only the worst customer counts (worst-case). d=1: every customer counts the
     same (plain sum of 1 - s_i). Values in between: the worse off, the more it counts."""    
+    worst_case_alpha: float = 0.0
+    """Penalty weight on the worst-case (Rawlsian) cost: per group, 1 - lowest s_i so far."""
 
     # Env options:
     num_discretization_levels: int = 10
@@ -545,6 +558,13 @@ class Chargax(jym.Environment):
             [scored & ~ports.charge_sensitive, scored & ports.charge_sensitive]
         )
         g = in_group.astype(float)
+
+        # Bad service: 1 - s above each BSR level, i.e. missing energy share
+        # (time-sensitive) or overtime share of the actual stay (charge-sensitive)
+        shortfall_kw = jnp.maximum(ports.car_battery_desired_remaining_kw, 0.0)
+        overtime_min = jnp.maximum(-ports.car_time_till_leave, 0).astype(float)
+        is_bad = (1.0 - s)[None, :] > jnp.asarray(BSR_LEVELS)[:, None]  # (levels, N)
+
         state = state._replace(
             fairness_cost=state.fairness_cost + fairness_cost,
             group_served=state.group_served + g.sum(-1),
@@ -554,6 +574,13 @@ class Chargax(jym.Environment):
             + (g * (s < self.fairness_threshold)).sum(-1),
             group_min_s=jnp.minimum(
                 state.group_min_s, jnp.min(jnp.where(in_group, s, 1.0), axis=-1)
+            ),
+            group_bad=state.group_bad + (g[:, None, :] * is_bad[None]).sum(-1),
+            max_shortfall_kw=jnp.maximum(
+                state.max_shortfall_kw, jnp.max(in_group[0] * shortfall_kw)
+            ),
+            max_overtime_min=jnp.maximum(
+                state.max_overtime_min, jnp.max(in_group[1] * overtime_min)
             ),
         )
         return self.update_ggi_values(state, s, scored)
@@ -708,6 +735,8 @@ class Chargax(jym.Environment):
             # Change in today's GGI: these add up to the end-of-day GGI over the period of a day,
             # but the agent is penalised at the step the customer leaves.
             + self.ggi_alpha * (new_state.ggi_cost - old_state.ggi_cost)            
+            + self.worst_case_alpha
+            * (self.worst_case_cost(new_state) - self.worst_case_cost(old_state))
         )
 
     def get_terminated(self, state: EnvState) -> bool:
@@ -735,8 +764,13 @@ class Chargax(jym.Environment):
             "sat_undertime_norm": state.sat_undertime_norm,
             "fairness_cost": state.fairness_cost,
             "ggi_cost": state.ggi_cost,            
+            "worst_case_cost": self.worst_case_cost(state),
             **self.get_fairness_metrics(state),
         }
+
+    def worst_case_cost(self, state: EnvState) -> Array:
+        """Worst-case (Rawlsian) cost, per group"""
+        return jnp.sum(1.0 - state.group_min_s)
 
     def get_fairness_metrics(self, state: EnvState) -> Dict[str, Array]:
         """Three-layer fairness metrics. Group 0 = time-sensitive, 1 = charge-sensitive.
@@ -749,6 +783,15 @@ class Chargax(jym.Environment):
         # Both groups pooled, kept for reference
         n_all, s_all, sq_all = n.sum(), s_sum.sum(), sq_sum.sum()
         jain_all = jnp.where(n_all > 0, s_all**2 / jnp.maximum(n_all * sq_all, 1e-8), 1.0)
+        # Bad service rate: share of the scored customers that were badly served
+        bsr = state.group_bad / jnp.maximum(n, 1)[:, None]
+        bsr_all = state.group_bad.sum(0) / jnp.maximum(n.sum(), 1)
+        bsr_metrics = {}
+        for i, level in enumerate(BSR_LEVELS):
+            pct = round(level * 100)
+            bsr_metrics[f"bsr_time_{pct}"] = bsr[0, i]
+            bsr_metrics[f"bsr_charge_{pct}"] = bsr[1, i]
+            bsr_metrics[f"bsr_overall_{pct}"] = bsr_all[i]
         return {
             "jain_time": jain[0],
             "jain_charge": jain[1],
@@ -765,6 +808,10 @@ class Chargax(jym.Environment):
             "worst_group_min_s": jnp.min(state.group_min_s),
             "jain_overall": jain_all,
             "mean_s_overall": jnp.where(n_all > 0, s_all / jnp.maximum(n_all, 1), 1.0),
+            # Rawlsian worst case in raw units
+            "max_shortfall_kw": state.max_shortfall_kw,
+            "max_overtime_min": state.max_overtime_min,
+            **bsr_metrics,
         }
 
     def kw_to_kw_this_timestep(self, kw_drawn: Float[Array, "..."]) -> Array:
