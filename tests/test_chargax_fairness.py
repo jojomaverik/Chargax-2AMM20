@@ -28,7 +28,7 @@ def _leaving_ports(env: Chargax) -> EVSE:
     """Four cars wanting 50 kWh more (0 -> 50 of 100 kWh), planned stay 100 minutes:
     0: time-sensitive, 35 kWh delivered (30% missing)
     1: time-sensitive, 49 kWh delivered (2% missing)
-    2: charge-sensitive, 130 minutes waited (30% overtime)
+    2: charge-sensitive, 130 minutes waited (30 min overtime, 23% of the actual stay)
     3: charge-sensitive, 100 minutes waited (no overtime)"""
     return env.station.evses_flat.replace(
         car_battery_capacity_kw=jnp.full(4, 100.0),

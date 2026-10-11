@@ -21,7 +21,7 @@ from ._station_layout import EVSE, ChargingStation, StationBattery, _PassiveNode
 BSR_LEVELS = (0.1, 0.2, 0.5)
 """Bad service rate thresholds. A time-sensitive customer is badly served when more than
 this share of the requested energy is missing at departure, a charge-sensitive customer
-when the overtime is more than this share of the planned stay."""
+when the overtime is more than this share of the actual stay (both are 1 - s_i)."""
 
 
 class EnvState(jym.EnvState):
@@ -541,14 +541,11 @@ class Chargax(jym.Environment):
         )
         g = in_group.astype(float)
 
-        # Bad service: missing energy share (time-sensitive) or overtime share of the
-        # planned stay (charge-sensitive) above each BSR level
+        # Bad service: 1 - s above each BSR level, i.e. missing energy share
+        # (time-sensitive) or overtime share of the actual stay (charge-sensitive)
         shortfall_kw = jnp.maximum(ports.car_battery_desired_remaining_kw, 0.0)
         overtime_min = jnp.maximum(-ports.car_time_till_leave, 0).astype(float)
-        planned_stay = ports.car_time_waited + ports.car_time_till_leave
-        overtime_frac = overtime_min / jnp.maximum(planned_stay, 1)
-        bad_frac = jnp.where(ports.charge_sensitive, overtime_frac, 1.0 - s)
-        is_bad = bad_frac[None, :] > jnp.asarray(BSR_LEVELS)[:, None]  # (levels, N)
+        is_bad = (1.0 - s)[None, :] > jnp.asarray(BSR_LEVELS)[:, None]  # (levels, N)
 
         return state._replace(
             fairness_cost=state.fairness_cost + fairness_cost,
