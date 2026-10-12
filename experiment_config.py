@@ -100,7 +100,7 @@ METRICS = {
         "unfair_time", "unfair_charge",
     ],
     "2) Between groups": ["mean_s_time", "mean_s_charge", "group_gap"],
-    "3) Summary": ["worst_group_jain", "worst_group_min_s", "fairness_cost", "worst_case_cost"],
+    "3) Summary": ["worst_group_jain", "worst_group_min_s", "fairness_cost", "worst_case_cost", "ggi_cost"],
     # Rawlsian worst case in raw units: largest missing kWh / overtime minutes of the day
     "4) Worst case": ["max_shortfall_kw", "max_overtime_min"],
     # Bad service rate: share of customers with > 10/20/50% energy missing or overtime
