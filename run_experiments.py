@@ -37,20 +37,13 @@ from experiment_config import (
 # with a budget on the average daily fairness_cost.
 METHODS = {
     "PPO": {"env": {}},
+    "kWh penalty a=1": {"env": {"charged_satisfaction_alpha": 1.0}},
+    "Overtime penalty a=1": {"env": {"time_satisfaction_alpha": 1.0}},
+    "Norm. satisfaction a=10": {"env": {"norm_satisfaction_alpha": 10.0}},
     "Fair a=10": {"env": {"fairness_alpha": 10.0}},
     "Fair a=50": {"env": {"fairness_alpha": 50.0}},
-    # Worst-case (Rawlsian) penalty: per group, 1 - lowest satisfaction of the day (0 to 2)
-    "Worst-case a=10": {"env": {"worst_case_alpha": 10.0}},
-    "Worst-case a=50": {"env": {"worst_case_alpha": 50.0}},
-    # Budgets on the average daily fairness_cost. For reference (2M-step test run):
-    # MaxCharge ~1.7, profit-only PPO ~8. Budgets below ~1.7 may not be reachable.
     "Lagrangian d=4.0": {"budget": 4.0},
     "Lagrangian d=2.0": {"budget": 2.0},
-    # "Lagrangian d=1.0": {"budget": 1.0},
-    # Chargax's own satisfaction penalties (teammates' part) can run through the same
-    # pipeline, so all rows of the final table are measured the same way:
-    # "kWh penalty a=1": {"env": {"charged_satisfaction_alpha": 1.0}},
-    # "Overtime penalty a=1": {"env": {"time_satisfaction_alpha": 1.0}},
 }
 
 TOTAL_TIMESTEPS = 10_000_000  # same as the paper and the replication
