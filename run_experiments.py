@@ -34,7 +34,7 @@ from experiment_config import (
 )
 
 # Each method is either a fixed set of reward weights ("env") or a Lagrangian run
-# with a budget on the average daily fairness_cost.
+# with a budget on the average daily cost ("cost", default fairness_cost).
 METHODS = {
     "PPO": {"env": {}},
     "kWh penalty a=1": {"env": {"charged_satisfaction_alpha": 1.0}},
@@ -45,9 +45,15 @@ METHODS = {
     # GGI of daily dissatisfaction (1 - s_i), weights 1, 0.5, 0.25, ... (0 to 2)
     "GGI a=10": {"env": {"ggi_alpha": 10.0}},
     "GGI a=50": {"env": {"ggi_alpha": 50.0}},
-    "Lagrangian d=4.0": {"budget": 4.0},
-    "Lagrangian d=2.0": {"budget": 2.0},
+    "Fair Lagrangian d=4.0": {"budget": 4.0},
+    "Fair Lagrangian d=2.0": {"budget": 2.0},
+    # Same, with a budget on the daily GGI cost (0 to 2) instead
+    "GGI Lagrangian d=1.0": {"budget": 1.0, "cost": "ggi_cost"},
+    "GGI Lagrangian d=0.5": {"budget": 0.5, "cost": "ggi_cost"},
 }
+
+# Constrained cost -> the env weight that acts as its Lagrange multiplier
+LAGRANGE_ALPHA = {"fairness_cost": "fairness_alpha", "ggi_cost": "ggi_alpha"}
 
 TOTAL_TIMESTEPS = 10_000_000  # same as the paper and the replication
 SEEDS = [0, 1, 2]
@@ -70,9 +76,11 @@ def train_fixed(env_kwargs, steps, seed):
     return agent, []
 
 
-def train_lagrangian(budget, steps, seed, name):
-    """PPO-Lagrangian: reward = profit - lambda * fairness_cost, and after every chunk
-    lambda <- clip(lambda + LAMBDA_LR * (J_c - budget), 0, LAMBDA_MAX)."""
+def train_lagrangian(budget, steps, seed, name, cost="fairness_cost"):
+    """PPO-Lagrangian: reward = profit - lambda * cost, and after every chunk
+    lambda <- clip(lambda + LAMBDA_LR * (J_c - budget), 0, LAMBDA_MAX).
+    cost is an info key in LAGRANGE_ALPHA (fairness_cost or ggi_cost)."""
+    alpha = LAGRANGE_ALPHA[cost]
     base_env = make_env()
     cost_eval = make_evaluator(make_env(), LAMBDA_EVAL_DAYS)
     chunk = steps // LAMBDA_CHUNKS
@@ -80,7 +88,7 @@ def train_lagrangian(budget, steps, seed, name):
     def with_lambda(lam):
         # lambda as a JAX array, so changing it does not trigger recompilation
         return jym.LogWrapper(
-            eqx.tree_at(lambda e: e.fairness_alpha, base_env, jnp.asarray(lam, jnp.float32))
+            eqx.tree_at(lambda e: getattr(e, alpha), base_env, jnp.asarray(lam, jnp.float32))
         )
 
     # The networks and optimizer are created once for the full run length, so the
@@ -95,10 +103,10 @@ def train_lagrangian(budget, steps, seed, name):
         agent = train_chunk(agent, k_train, with_lambda(lam))
 
         info = cost_eval(PPOPolicy(agent), k_eval)
-        j_c = float(info["fairness_cost"].mean())
+        j_c = float(info[cost].mean())
         log.append({
             "method": name, "seed": seed, "chunk": i + 1, "steps": (i + 1) * chunk,
-            "lambda": lam, "J_c": j_c, "profit": float(info["profit"].mean()),
+            "cost": cost, "lambda": lam, "J_c": j_c, "profit": float(info["profit"].mean()),
             "rejected_customers": float(info["rejected_customers"].mean()),
         })
         if i + 1 >= LAMBDA_WARMUP_CHUNKS:
@@ -192,7 +200,10 @@ if __name__ == "__main__":
                 print(f"train {name} | seed {seed} | {args.steps:,} steps ...", flush=True)
                 t0 = time.time()
                 if "budget" in spec:
-                    agent, log = train_lagrangian(spec["budget"], args.steps, seed, name)
+                    agent, log = train_lagrangian(
+                        spec["budget"], args.steps, seed, name,
+                        spec.get("cost", "fairness_cost"),
+                    )
                 else:
                     agent, log = train_fixed(spec["env"], args.steps, seed)
                 info = evaluate(PPOPolicy(agent), eval_key)
