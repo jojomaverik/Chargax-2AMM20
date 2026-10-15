@@ -50,8 +50,9 @@ METHODS = {
     "Fair Lagrangian d=4.0": {"budget": 4.0},
     "Fair Lagrangian d=2.0": {"budget": 2.0},
     # Same, with a budget on the daily GGI cost (0 to 2) instead
+    "GGI Lagrangian d=1.7": {"budget": 1.7, "cost": "ggi_cost"},
     "GGI Lagrangian d=1.5": {"budget": 1.5, "cost": "ggi_cost"},
-    "GGI Lagrangian d=1.3": {"budget": 1.3, "cost": "ggi_cost"},
+    "GGI Lagrangian d=1.4": {"budget": 1.4, "cost": "ggi_cost"},
 }
 
 # Constrained cost -> the env weight that acts as its Lagrange multiplier
@@ -63,9 +64,11 @@ EVAL_DAYS = 100  # test days, identical for every method and seed
 EVAL_SEED = 12345
 
 LAMBDA_CHUNKS = 40  # lambda is updated after each chunk of training
-LAMBDA_LR = 2.0
+# Step size and upper bound of lambda per constrained cost. ggi_cost is small (0 to 2)
+# and needs a weight of ~100-200 to reach its budgets, so its lambda moves faster.
+LAMBDA_LR = {"fairness_cost": 2.0, "ggi_cost": 30.0}
 LAMBDA_WARMUP_CHUNKS = 4  # no lambda updates in the first 10%: the policy is still random
-LAMBDA_MAX = 200.0  # upper bound, so lambda cannot explode early in training
+LAMBDA_MAX = {"fairness_cost": 200.0, "ggi_cost": 400.0}  # so lambda cannot explode
 LAMBDA_EVAL_DAYS = 16  # days used to estimate the fairness cost after each chunk
 
 # Output files get the training length in their name, so a quick try never mixes
@@ -80,7 +83,7 @@ def train_fixed(env_kwargs, steps, seed):
 
 def train_lagrangian(budget, steps, seed, name, cost="fairness_cost"):
     """PPO-Lagrangian: reward = profit - lambda * cost, and after every chunk
-    lambda <- clip(lambda + LAMBDA_LR * (J_c - budget), 0, LAMBDA_MAX).
+    lambda <- clip(lambda + LAMBDA_LR[cost] * (J_c - budget), 0, LAMBDA_MAX[cost]).
     cost is an info key in LAGRANGE_ALPHA (fairness_cost or ggi_cost)."""
     alpha = LAGRANGE_ALPHA[cost]
     base_env = make_env()
@@ -112,7 +115,7 @@ def train_lagrangian(budget, steps, seed, name, cost="fairness_cost"):
             "rejected_customers": float(info["rejected_customers"].mean()),
         })
         if i + 1 >= LAMBDA_WARMUP_CHUNKS:
-            lam = min(LAMBDA_MAX, max(0.0, lam + LAMBDA_LR * (j_c - budget)))
+            lam = min(LAMBDA_MAX[cost], max(0.0, lam + LAMBDA_LR[cost] * (j_c - budget)))
     return agent, log
 
 
