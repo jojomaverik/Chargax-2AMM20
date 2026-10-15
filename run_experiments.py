@@ -43,13 +43,15 @@ METHODS = {
     "Fair a=10": {"env": {"fairness_alpha": 10.0}},
     "Fair a=50": {"env": {"fairness_alpha": 50.0}},
     # GGI of daily dissatisfaction (1 - s_i), weights 1, 0.5, 0.25, ... (0 to 2)
-    "GGI a=10": {"env": {"ggi_alpha": 10.0}},
     "GGI a=50": {"env": {"ggi_alpha": 50.0}},
+    "GGI a=75": {"env": {"ggi_alpha": 75.0}},
+    "GGI a=100": {"env": {"ggi_alpha": 100.0}},
+    "GGI a=200": {"env": {"ggi_alpha": 200.0}},
     "Fair Lagrangian d=4.0": {"budget": 4.0},
     "Fair Lagrangian d=2.0": {"budget": 2.0},
     # Same, with a budget on the daily GGI cost (0 to 2) instead
-    "GGI Lagrangian d=1.0": {"budget": 1.0, "cost": "ggi_cost"},
-    "GGI Lagrangian d=0.5": {"budget": 0.5, "cost": "ggi_cost"},
+    "GGI Lagrangian d=1.5": {"budget": 1.5, "cost": "ggi_cost"},
+    "GGI Lagrangian d=1.3": {"budget": 1.3, "cost": "ggi_cost"},
 }
 
 # Constrained cost -> the env weight that acts as its Lagrange multiplier
